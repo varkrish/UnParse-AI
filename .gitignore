@@ -1,0 +1,27 @@
+# Maven / Java Build Artifacts
+**/target/
+**/*.class
+
+# Node / React Build Artifacts
+**/node_modules/
+**/dist/
+
+# OS files
+.DS_Store
+
+# Kùzu database directory
+.gemini_db/
+test_db/
+
+# Legacy outputs
+java_output/
+python_output/
+react_output/
+
+# Python bytecode
+**/__pycache__/
+**/*.pyc
+
+# IDE / Agent temp files
+.env
+.agents/
