@@ -117,5 +117,47 @@ def main():
         
     print(f"✅ Generated React Component inside {REACT_OUTPUT}")
 
+    # 3. Link Full Stack Boundaries in the AST Database
+    print("\n🔗 Linking cross-stack REST APIs in the graph database...")
+    link_fullstack_endpoints(conn)
+
+def link_fullstack_endpoints(conn):
+    # Retrieve Java controller functions
+    controllers = _q(conn, "MATCH (m:Module)-[:HAS_FUNCTION_Module]->(f:Function) WHERE m.name = 'controller/CalculatorController' RETURN f.id, f.name, f.decorators")
+    
+    # Retrieve UI functions
+    ui_funcs = _q(conn, "MATCH (m:Module)-[:HAS_FUNCTION_Module]->(f:Function) WHERE m.name = 'ui/CalculatorApp' RETURN f.id, f.name")
+    
+    for c in controllers:
+        c_id = c["f.id"]
+        c_name = c["f.name"]
+        decorators = c["f.decorators"] or ""
+        
+        # Parse path & method
+        method = "POST" if "@PostMapping" in decorators else "GET"
+        path = "/api"
+        for line in decorators.split("\n"):
+            if "@RequestMapping" in line:
+                # E.g. @RequestMapping("/api") -> /api
+                parts = line.split('"')
+                if len(parts) > 1:
+                    path = parts[1]
+            if "Mapping" in line:
+                parts = line.split('"')
+                if len(parts) > 1:
+                    path += parts[1]
+                    
+        for u in ui_funcs:
+            u_id = u["f.id"]
+            u_name = u["f.name"]
+            
+            if u_name.lower() == c_name.lower():
+                print(f"   ⚡ Linked: React '{u_name}()' ──► Java REST Endpoint '{path}' ({method})")
+                conn.execute(
+                    "MATCH (a:Function {id: $a_id}), (b:Function {id: $b_id}) "
+                    "MERGE (a)-[:CALLS_API {path: $path, method: $method}]->(b)",
+                    {"a_id": u_id, "b_id": c_id, "path": path, "method": method}
+                )
+
 if __name__ == "__main__":
     main()

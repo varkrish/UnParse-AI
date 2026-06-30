@@ -141,6 +141,12 @@ def create_schema(conn: kuzu.Connection) -> None:
     for ddl in edge_ddls:
         conn.execute(ddl)
 
+    # CALLS_API: cross-stack link between UI function and Controller function
+    conn.execute(
+        "CREATE REL TABLE IF NOT EXISTS CALLS_API("
+        "FROM Function TO Function, path STRING, method STRING)"
+    )
+
     print(f"✅ Schema created: {len(node_ddls)} node tables, {len(edge_ddls)} edge tables.")
 
 
