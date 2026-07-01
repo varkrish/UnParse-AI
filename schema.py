@@ -7,34 +7,34 @@ live database using CALL show_tables() and CALL table_info().
 
 Kùzu 0.11 DDL rule: each CREATE REL TABLE must have exactly ONE
 FROM/TO pair. Properties follow the FROM/TO clause.
+
+v0.2.0 — Unified Statement/Expression tables with kind discriminator.
+         Cross-product edge tables collapsed to one-per-block-parent.
 """
 
 import kuzu
 import os
+from datetime import datetime, timezone
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "ast_db")
 
-# All statement-type node names (used to generate HAS_STMT and HAS_EXPR edges)
-STMT_TYPES = [
+SCHEMA_VERSION = "0.2.0"
+
+# Valid statement kinds (for validation, not for generating tables)
+STMT_KINDS = [
     "Assign", "Return", "IfStmt", "ForLoop", "WhileLoop",
     "ExprStmt", "Pass", "Break", "Continue",
 ]
 
-# All expression-type node names
-EXPR_TYPES = [
+# Valid expression kinds
+EXPR_KINDS = [
     "Name", "Constant", "BinOp", "UnaryOp", "Compare",
     "Call", "Attribute", "BoolOp", "IfExp", "ListExpr", "DictExpr",
+    "CmpOp",  # normalized comparison operator node
 ]
 
-# Which nodes can contain statements (block parents)
+# Block parents that can contain child statements
 BLOCK_PARENTS = ["Function", "IfStmt", "ForLoop", "WhileLoop"]
-
-# Which nodes can have expression children via HAS_EXPR
-EXPR_PARENTS = [
-    "Return", "Assign", "IfStmt", "ForLoop", "WhileLoop", "ExprStmt",
-    "BinOp", "UnaryOp", "Compare", "Call", "Attribute",
-    "BoolOp", "IfExp", "ListExpr", "DictExpr",
-]
 
 
 def get_db() -> kuzu.Database:
@@ -50,104 +50,152 @@ def create_schema(conn: kuzu.Connection) -> None:
 
     # ── Node tables ───────────────────────────────────────────────────────────
     node_ddls = [
+        # Schema metadata (versioning)
+        "CREATE NODE TABLE IF NOT EXISTS SchemaMetadata("
+        "version STRING PRIMARY KEY, created_at STRING)",
+
         # Structural
-        "CREATE NODE TABLE IF NOT EXISTS Module(id STRING PRIMARY KEY, name STRING, decorators STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS Function(id STRING PRIMARY KEY, name STRING, return_type STRING, decorators STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS Class(id STRING PRIMARY KEY, name STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS Argument(id STRING PRIMARY KEY, name STRING, type_annotation STRING)",
+        "CREATE NODE TABLE IF NOT EXISTS Module("
+        "id STRING PRIMARY KEY, name STRING, decorators STRING)",
+
+        "CREATE NODE TABLE IF NOT EXISTS Function("
+        "id STRING PRIMARY KEY, name STRING, return_type STRING, decorators STRING)",
+
+        "CREATE NODE TABLE IF NOT EXISTS Class("
+        "id STRING PRIMARY KEY, name STRING)",
+
+        "CREATE NODE TABLE IF NOT EXISTS Argument("
+        "id STRING PRIMARY KEY, name STRING, type_annotation STRING)",
+
         # Imports and Dependencies
-        "CREATE NODE TABLE IF NOT EXISTS Import(id STRING PRIMARY KEY, names STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS ImportFrom(id STRING PRIMARY KEY, module STRING, names STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS Dependency(id STRING PRIMARY KEY, name STRING, version STRING)",
-        # Statements
-        "CREATE NODE TABLE IF NOT EXISTS Assign(id STRING PRIMARY KEY, targets STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS Return(id STRING PRIMARY KEY)",
-        "CREATE NODE TABLE IF NOT EXISTS IfStmt(id STRING PRIMARY KEY)",
-        "CREATE NODE TABLE IF NOT EXISTS ForLoop(id STRING PRIMARY KEY, target STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS WhileLoop(id STRING PRIMARY KEY)",
-        "CREATE NODE TABLE IF NOT EXISTS ExprStmt(id STRING PRIMARY KEY)",
-        "CREATE NODE TABLE IF NOT EXISTS Pass(id STRING PRIMARY KEY)",
-        "CREATE NODE TABLE IF NOT EXISTS Break(id STRING PRIMARY KEY)",
-        "CREATE NODE TABLE IF NOT EXISTS Continue(id STRING PRIMARY KEY)",
-        # Expressions
-        "CREATE NODE TABLE IF NOT EXISTS Name(id STRING PRIMARY KEY, value STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS Constant(id STRING PRIMARY KEY, value STRING, kind STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS BinOp(id STRING PRIMARY KEY, op STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS UnaryOp(id STRING PRIMARY KEY, op STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS Compare(id STRING PRIMARY KEY, ops STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS Call(id STRING PRIMARY KEY, func STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS Attribute(id STRING PRIMARY KEY, attr STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS BoolOp(id STRING PRIMARY KEY, op STRING)",
-        "CREATE NODE TABLE IF NOT EXISTS IfExp(id STRING PRIMARY KEY)",
-        "CREATE NODE TABLE IF NOT EXISTS ListExpr(id STRING PRIMARY KEY)",
-        "CREATE NODE TABLE IF NOT EXISTS DictExpr(id STRING PRIMARY KEY)",
+        "CREATE NODE TABLE IF NOT EXISTS Import("
+        "id STRING PRIMARY KEY, names STRING)",
+
+        "CREATE NODE TABLE IF NOT EXISTS ImportFrom("
+        "id STRING PRIMARY KEY, module STRING, names STRING)",
+
+        "CREATE NODE TABLE IF NOT EXISTS Dependency("
+        "id STRING PRIMARY KEY, name STRING, version STRING)",
+
+        # Unified Statement table (kind discriminator + nullable union columns)
+        "CREATE NODE TABLE IF NOT EXISTS Statement("
+        "id STRING PRIMARY KEY, "
+        "kind STRING, "        # "Assign", "Return", "IfStmt", etc.
+        "targets STRING, "     # Assign (kept for backward compat until fully migrated)
+        "target STRING"        # ForLoop
+        ")",
+
+        # Unified Expression table (kind discriminator + nullable union columns)
+        "CREATE NODE TABLE IF NOT EXISTS Expression("
+        "id STRING PRIMARY KEY, "
+        "kind STRING, "        # "Name", "Constant", "BinOp", etc.
+        "value STRING, "       # Name.value, Constant.value
+        "op STRING, "          # BinOp.op, UnaryOp.op, BoolOp.op, CmpOp.op
+        "ops STRING, "         # Compare.ops (kept for backward compat)
+        "func STRING, "        # Call.func
+        "attr STRING, "        # Attribute.attr
+        "kind_lit STRING"      # Constant.kind ("int", "str", etc.)
+        ")",
     ]
 
     for ddl in node_ddls:
         conn.execute(ddl)
 
     # ── Edge tables ───────────────────────────────────────────────────────────
-    # Kùzu 0.11: one FROM/TO pair per CREATE REL TABLE statement.
-    # We programmatically generate all needed pairs.
 
-    edge_ddls: list[str] = []
+    edge_ddls: list[str] = [
+        # HAS_IMPORT: Module → Import, Module → ImportFrom
+        "CREATE REL TABLE IF NOT EXISTS HAS_IMPORT_Import("
+        "FROM Module TO Import, ord INT64)",
 
-    # HAS_IMPORT: Module → Import, Module → ImportFrom
-    for target in ["Import", "ImportFrom"]:
-        edge_ddls.append(
-            f"CREATE REL TABLE IF NOT EXISTS HAS_IMPORT_{target}("
-            f"FROM Module TO {target}, ord INT)"
-        )
+        "CREATE REL TABLE IF NOT EXISTS HAS_IMPORT_ImportFrom("
+        "FROM Module TO ImportFrom, ord INT64)",
 
-    # HAS_DEPENDENCY: Module → Dependency
-    edge_ddls.append(
+        # HAS_DEPENDENCY: Module → Dependency
         "CREATE REL TABLE IF NOT EXISTS HAS_DEPENDENCY("
-        "FROM Module TO Dependency, ord INT)"
-    )
+        "FROM Module TO Dependency, ord INT64)",
 
-    # HAS_FUNCTION: Module → Function, Class → Function
-    for src in ["Module", "Class"]:
-        edge_ddls.append(
-            f"CREATE REL TABLE IF NOT EXISTS HAS_FUNCTION_{src}("
-            f"FROM {src} TO Function, ord INT)"
-        )
+        # HAS_FUNCTION: Module → Function, Class → Function
+        "CREATE REL TABLE IF NOT EXISTS HAS_FUNCTION_Module("
+        "FROM Module TO Function, ord INT64)",
 
-    # HAS_CLASS: Module → Class
-    edge_ddls.append(
-        "CREATE REL TABLE IF NOT EXISTS HAS_CLASS(FROM Module TO Class, ord INT)"
-    )
+        "CREATE REL TABLE IF NOT EXISTS HAS_FUNCTION_Class("
+        "FROM Class TO Function, ord INT64)",
 
-    # HAS_ARG: Function → Argument
-    edge_ddls.append(
-        "CREATE REL TABLE IF NOT EXISTS HAS_ARG(FROM Function TO Argument, position INT)"
-    )
+        # HAS_CLASS: Module → Class
+        "CREATE REL TABLE IF NOT EXISTS HAS_CLASS("
+        "FROM Module TO Class, ord INT64)",
 
-    # HAS_STMT: BlockParent → StmtType  (all combinations)
-    for parent in BLOCK_PARENTS:
-        for child in STMT_TYPES:
-            edge_ddls.append(
-                f"CREATE REL TABLE IF NOT EXISTS HAS_STMT_{parent}_{child}("
-                f"FROM {parent} TO {child}, ord INT, branch STRING)"
-            )
+        # HAS_ARG: Function → Argument
+        "CREATE REL TABLE IF NOT EXISTS HAS_ARG("
+        "FROM Function TO Argument, position INT64)",
 
-    # HAS_EXPR: ExprParent → ExprType  (all combinations)
-    for parent in EXPR_PARENTS:
-        for child in EXPR_TYPES:
-            edge_ddls.append(
-                f"CREATE REL TABLE IF NOT EXISTS HAS_EXPR_{parent}_{child}("
-                f"FROM {parent} TO {child}, role STRING, ord INT)"
-            )
+        # ── Collapsed statement edges (one per block-parent type) ────────────
+        # Function → Statement
+        "CREATE REL TABLE IF NOT EXISTS HAS_STMT_Function("
+        "FROM Function TO Statement, ord INT64, role STRING)",
+
+        # Statement → Statement (IfStmt body/orelse)
+        "CREATE REL TABLE IF NOT EXISTS HAS_STMT_IfStmt("
+        "FROM Statement TO Statement, ord INT64, role STRING)",
+
+        # Statement → Statement (ForLoop body)
+        "CREATE REL TABLE IF NOT EXISTS HAS_STMT_ForLoop("
+        "FROM Statement TO Statement, ord INT64, role STRING)",
+
+        # Statement → Statement (WhileLoop body)
+        "CREATE REL TABLE IF NOT EXISTS HAS_STMT_WhileLoop("
+        "FROM Statement TO Statement, ord INT64, role STRING)",
+
+        # ── Collapsed expression edges (one per parent category) ─────────────
+        # Statement → Expression
+        "CREATE REL TABLE IF NOT EXISTS HAS_EXPR_Statement("
+        "FROM Statement TO Expression, role STRING, ord INT64)",
+
+        # Expression → Expression
+        "CREATE REL TABLE IF NOT EXISTS HAS_EXPR_Expression("
+        "FROM Expression TO Expression, role STRING, ord INT64)",
+
+        # Function → Expression (for future use: default values, decorators)
+        "CREATE REL TABLE IF NOT EXISTS HAS_EXPR_Function("
+        "FROM Function TO Expression, role STRING, ord INT64)",
+
+        # CALLS_API: cross-stack link between UI function and Controller function
+        "CREATE REL TABLE IF NOT EXISTS CALLS_API("
+        "FROM Function TO Function, path STRING, method STRING)",
+    ]
 
     for ddl in edge_ddls:
         conn.execute(ddl)
 
-    # CALLS_API: cross-stack link between UI function and Controller function
-    conn.execute(
-        "CREATE REL TABLE IF NOT EXISTS CALLS_API("
-        "FROM Function TO Function, path STRING, method STRING)"
-    )
+    # ── Indexes ───────────────────────────────────────────────────────────────
+    index_ddls = [
+        "CREATE INDEX IF NOT EXISTS idx_function_name ON Function(name)",
+        "CREATE INDEX IF NOT EXISTS idx_class_name ON Class(name)",
+        "CREATE INDEX IF NOT EXISTS idx_module_name ON Module(name)",
+        "CREATE INDEX IF NOT EXISTS idx_statement_kind ON Statement(kind)",
+        "CREATE INDEX IF NOT EXISTS idx_expression_kind ON Expression(kind)",
+    ]
+    for ddl in index_ddls:
+        try:
+            conn.execute(ddl)
+        except Exception:
+            # Some Kùzu versions may not support CREATE INDEX IF NOT EXISTS
+            pass
 
-    print(f"✅ Schema created: {len(node_ddls)} node tables, {len(edge_ddls)} edge tables.")
+    # ── Schema version ────────────────────────────────────────────────────────
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        conn.execute(
+            "MERGE (m:SchemaMetadata {version: $ver}) "
+            "SET m.created_at = $ts",
+            {"ver": SCHEMA_VERSION, "ts": now},
+        )
+    except Exception:
+        pass
+
+    print(f"✅ Schema v{SCHEMA_VERSION} created: "
+          f"{len(node_ddls)} node tables, {len(edge_ddls)} edge tables.")
 
 
 def init_db() -> tuple[kuzu.Database, kuzu.Connection]:
@@ -179,3 +227,4 @@ if __name__ == "__main__":
             rel_names.append(row[1])
     print(f"\n📊 Registered: {len(node_names)} node tables, {len(rel_names)} rel tables")
     print("\nNode tables:", sorted(node_names))
+    print("Rel tables:", sorted(rel_names))

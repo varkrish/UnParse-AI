@@ -4,6 +4,10 @@ tools.py — High-level tool functions for AST graph mutation.
 This file provides Python functions that the LLM can call as "tools".
 Each function maps to deterministic Cypher CREATE/MATCH statements in Kùzu,
 preventing Cartesian products and invalid edges.
+
+v0.2.0 — All statements write to unified Statement table with kind discriminator.
+         All expressions write to unified Expression table with kind discriminator.
+         Edge tables are collapsed: one per block-parent type.
 """
 
 from __future__ import annotations
@@ -21,6 +25,36 @@ def _execute(cypher: str, params: dict | None = None):
     if _conn is None:
         raise RuntimeError("Kuzu connection not set in tools.py")
     _conn.execute(cypher, params or {})
+
+
+# ── Parent-type classification ────────────────────────────────────────────────
+
+# Statement kinds that can contain child statements
+_STMT_BLOCK_PARENTS = {"IfStmt", "ForLoop", "WhileLoop"}
+
+# Statement kinds (all live in the Statement table)
+_STMT_KINDS = {
+    "Assign", "Return", "IfStmt", "ForLoop", "WhileLoop",
+    "ExprStmt", "Pass", "Break", "Continue",
+}
+
+# Expression kinds (all live in the Expression table)
+_EXPR_KINDS = {
+    "Name", "Constant", "BinOp", "UnaryOp", "Compare",
+    "Call", "Attribute", "BoolOp", "IfExp", "ListExpr", "DictExpr",
+    "CmpOp",
+}
+
+# Branch-to-role mapping for backward compatibility
+_BRANCH_TO_ROLE = {
+    "then": "body",
+    "else": "orelse",
+    "body": "body",
+    "orelse": "orelse",
+    "handlers": "handlers",
+    "": "body",
+}
+
 
 # ── AST Tools ─────────────────────────────────────────────────────────────────
 
@@ -87,24 +121,44 @@ def add_dependency(module_id: str, dep_id: str, name: str, version: str, ord: in
 def add_statement(parent_id: str, parent_type: str, stmt_id: str, stmt_type: str, ord: int, branch: str = "") -> str:
     """
     Add a statement node to a block parent (Function, IfStmt, ForLoop, WhileLoop).
-    For IfStmt parents, branch must be 'then' or 'else'.
+    For IfStmt parents, branch must be 'then' or 'else' (mapped to role 'body'/'orelse').
     Example: add_statement('func_main', 'Function', 'ret_main', 'Return', 0)
     """
-    # Create the node (basic structure)
-    _execute(f"MERGE (s:{stmt_type} {{id: $id}})", {"id": stmt_id})
-    
-    # Create the edge
-    rel_type = f"HAS_STMT_{parent_type}_{stmt_type}"
+    # Create the Statement node with kind discriminator
     _execute(
-        f"MATCH (p:{parent_type} {{id: $pid}}), (s:{stmt_type} {{id: $sid}}) "
-        f"MERGE (p)-[:{rel_type} {{ord: $ord, branch: $branch}}]->(s)",
-        {"pid": parent_id, "sid": stmt_id, "ord": ord, "branch": branch}
+        "MERGE (s:Statement {id: $id}) SET s.kind = $kind",
+        {"id": stmt_id, "kind": stmt_type}
     )
+
+    # Map branch to role
+    role = _BRANCH_TO_ROLE.get(branch, branch if branch else "body")
+
+    # Determine the correct edge table based on parent type
+    if parent_type == "Function":
+        rel_table = "HAS_STMT_Function"
+        _execute(
+            f"MATCH (p:Function {{id: $pid}}), (s:Statement {{id: $sid}}) "
+            f"MERGE (p)-[:{rel_table} {{ord: $ord, role: $role}}]->(s)",
+            {"pid": parent_id, "sid": stmt_id, "ord": ord, "role": role}
+        )
+    elif parent_type in _STMT_BLOCK_PARENTS:
+        rel_table = f"HAS_STMT_{parent_type}"
+        _execute(
+            f"MATCH (p:Statement {{id: $pid}}), (s:Statement {{id: $sid}}) "
+            f"MERGE (p)-[:{rel_table} {{ord: $ord, role: $role}}]->(s)",
+            {"pid": parent_id, "sid": stmt_id, "ord": ord, "role": role}
+        )
+    else:
+        raise ValueError(f"Unknown block parent type: {parent_type}")
+
     return f"Added Statement {stmt_id} ({stmt_type}) to {parent_type} {parent_id}"
 
 def set_assign_targets(stmt_id: str, targets: str) -> str:
     """Set the targets property for an Assign statement (e.g. 'x, y')."""
-    _execute("MATCH (s:Assign {id: $id}) SET s.targets = $targets", {"id": stmt_id, "targets": targets})
+    _execute(
+        "MATCH (s:Statement {id: $id}) SET s.targets = $targets",
+        {"id": stmt_id, "targets": targets}
+    )
     return f"Set targets for {stmt_id} to '{targets}'"
 
 def add_expression(parent_id: str, parent_type: str, expr_id: str, expr_type: str, role: str, ord: int = 0, value: str = "", kind: str = "", func: str = "", op: str = "", ops: str = "") -> str:
@@ -114,28 +168,57 @@ def add_expression(parent_id: str, parent_type: str, expr_id: str, expr_type: st
     if expr_type == "Compare" and op and not ops:
         ops = op
         op = ""
-        
-    props = {"id": expr_id, "value": value, "kind": kind, "func": func, "op": op, "ops": ops}
-    
-    # Filter empty properties so we don't set a bunch of empty strings in Kuzu
-    props_filtered = {k: v for k, v in props.items() if v != ""}
-    
-    # Do not set 'id' in the SET clause as it is the primary key
-    set_props = {k: v for k, v in props_filtered.items() if k != "id"}
-    set_clause = ", ".join(f"e.{k} = ${k}" for k in set_props.keys())
-    
-    if set_clause:
-        _execute(f"MERGE (e:{expr_type} {{id: $id}}) SET {set_clause}", props_filtered)
+
+    # Build the Expression node with kind discriminator
+    props = {"id": expr_id, "kind_disc": expr_type}
+    set_parts = ["e.kind = $kind_disc"]
+
+    # Map properties to unified column names
+    if value:
+        props["value"] = value
+        set_parts.append("e.value = $value")
+    if kind:
+        # Constant.kind → kind_lit (to avoid clash with discriminator)
+        props["kind_lit"] = kind
+        set_parts.append("e.kind_lit = $kind_lit")
+    if func:
+        props["func"] = func
+        set_parts.append("e.func = $func")
+    if op:
+        props["op"] = op
+        set_parts.append("e.op = $op")
+    if ops:
+        props["ops"] = ops
+        set_parts.append("e.ops = $ops")
+
+    set_clause = ", ".join(set_parts)
+    _execute(f"MERGE (e:Expression {{id: $id}}) SET {set_clause}", props)
+
+    # Determine the correct edge table based on parent type
+    if parent_type == "Function":
+        rel_table = "HAS_EXPR_Function"
+        _execute(
+            f"MATCH (p:Function {{id: $pid}}), (e:Expression {{id: $eid}}) "
+            f"MERGE (p)-[:{rel_table} {{role: $role, ord: $ord}}]->(e)",
+            {"pid": parent_id, "eid": expr_id, "role": role, "ord": ord}
+        )
+    elif parent_type in _STMT_KINDS:
+        rel_table = "HAS_EXPR_Statement"
+        _execute(
+            f"MATCH (p:Statement {{id: $pid}}), (e:Expression {{id: $eid}}) "
+            f"MERGE (p)-[:{rel_table} {{role: $role, ord: $ord}}]->(e)",
+            {"pid": parent_id, "eid": expr_id, "role": role, "ord": ord}
+        )
+    elif parent_type in _EXPR_KINDS:
+        rel_table = "HAS_EXPR_Expression"
+        _execute(
+            f"MATCH (p:Expression {{id: $pid}}), (e:Expression {{id: $eid}}) "
+            f"MERGE (p)-[:{rel_table} {{role: $role, ord: $ord}}]->(e)",
+            {"pid": parent_id, "eid": expr_id, "role": role, "ord": ord}
+        )
     else:
-        _execute(f"MERGE (e:{expr_type} {{id: $id}})", props_filtered)
-        
-    # Create the edge
-    rel_type = f"HAS_EXPR_{parent_type}_{expr_type}"
-    _execute(
-        f"MATCH (p:{parent_type} {{id: $pid}}), (e:{expr_type} {{id: $eid}}) "
-        f"MERGE (p)-[:{rel_type} {{role: $role, ord: $ord}}]->(e)",
-        {"pid": parent_id, "eid": expr_id, "role": role, "ord": ord}
-    )
+        raise ValueError(f"Unknown expression parent type: {parent_type}")
+
     return f"Added Expression {expr_id} ({expr_type}) to {parent_type} {parent_id}"
 
 def get_tool_functions():

@@ -18,7 +18,7 @@ When an LLM generates raw Python or Java text, it is prone to indentation errors
 
 ## 🛠️ How It Works
 
-1. **Schema Initialization**: `run.py` initializes a Kùzu graph database with 26 node tables (Functions, Classes, Assigns, Calls) and 207 edge tables.
+1. **Schema Initialization**: `run.py` initializes a Kùzu graph database with 10 node tables (Functions, Classes, Assigns, Calls) and 15 edge tables.
 2. **LLM Agent**: A LangGraph agent parses a multi-file software spec. The LLM (e.g. GPT-4o, Qwen 35B) recursively calls AST tools to populate the Kùzu graph.
 3. **Unparsing**: Custom unparsers (`unparser.py` for Python, `java_unparser.py` for Java) traverse the Kùzu graph and transpile the logic into native source code.
 

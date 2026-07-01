@@ -7,6 +7,9 @@ so that `ast.unparse()` handles all formatting concerns.
 
 Flow:
   Kùzu graph → Python ast nodes → ast.fix_missing_locations → ast.unparse → str
+
+v0.2.0 — Unified Statement/Expression tables. Dispatch on kind column.
+         Single-query edge traversal (no cross-product loops).
 """
 
 from __future__ import annotations
@@ -16,6 +19,9 @@ import textwrap
 from typing import Any
 
 import kuzu
+
+from schema import SCHEMA_VERSION
+from src.ast_agent.graph_validator import validate_graph, GraphValidationError
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -32,53 +38,74 @@ def _q(conn: kuzu.Connection, cypher: str, params: dict | None = None) -> list[d
     return rows
 
 
+def _check_schema_version(conn: kuzu.Connection) -> None:
+    """Verify the DB schema version matches the unparser's expected version."""
+    try:
+        rows = _q(conn, "MATCH (m:SchemaMetadata) RETURN m.version")
+        if rows:
+            db_ver = rows[0]["m.version"]
+            if db_ver != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Schema version mismatch: DB has v{db_ver}, "
+                    f"unparser expects v{SCHEMA_VERSION}. "
+                    f"Recreate the database with the current schema.py."
+                )
+    except Exception as e:
+        if "SchemaMetadata" in str(e):
+            raise RuntimeError(
+                f"Database has no SchemaMetadata table. "
+                f"This database was created with schema < v0.2.0. "
+                f"Recreate with current schema.py."
+            )
+        raise
+
+
 # ── expression tree reconstruction ───────────────────────────────────────────
 
-def _build_expr(conn: kuzu.Connection, node_id: str, node_type: str) -> ast.expr:
+def _build_expr(conn: kuzu.Connection, node_id: str, kind: str) -> ast.expr:
     """Recursively reconstruct an ast.expr subtree from the graph."""
 
-    if node_type == "Name":
-        rows = _q(conn, "MATCH (n:Name {id: $id}) RETURN n.value", {"id": node_id})
+    if kind == "Name":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.value", {"id": node_id})
         return ast.Name(id=rows[0]["n.value"], ctx=ast.Load())
 
-    if node_type == "Constant":
-        rows = _q(conn, "MATCH (n:Constant {id: $id}) RETURN n.value, n.kind", {"id": node_id})
-        raw, kind = rows[0]["n.value"], rows[0]["n.kind"]
-        if kind == "int":
+    if kind == "Constant":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.value, n.kind_lit", {"id": node_id})
+        raw, kind_lit = rows[0]["n.value"], rows[0]["n.kind_lit"]
+        if kind_lit == "int":
             val = int(raw)
-        elif kind == "float":
+        elif kind_lit == "float":
             val = float(raw)
-        elif kind == "bool":
+        elif kind_lit == "bool":
             val = raw.lower() == "true"
-        elif kind == "none":
+        elif kind_lit == "none":
             val = None
         else:
             val = raw  # str
         return ast.Constant(value=val)
 
-    if node_type == "BinOp":
-        rows = _q(conn, "MATCH (n:BinOp {id: $id}) RETURN n.op", {"id": node_id})
+    if kind == "BinOp":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.op", {"id": node_id})
         op_str = rows[0]["n.op"]
         op_map = {
             "+": ast.Add(), "-": ast.Sub(), "*": ast.Mult(), "/": ast.Div(),
             "//": ast.FloorDiv(), "%": ast.Mod(), "**": ast.Pow(),
             "&": ast.BitAnd(), "|": ast.BitOr(), "^": ast.BitXor(),
         }
-        left  = _get_child_expr(conn, node_id, "BinOp", "left")
-        right = _get_child_expr(conn, node_id, "BinOp", "right")
+        left  = _get_child_expr(conn, node_id, "Expression", "left")
+        right = _get_child_expr(conn, node_id, "Expression", "right")
         return ast.BinOp(left=left, op=op_map[op_str], right=right)
 
-    if node_type == "UnaryOp":
-        rows = _q(conn, "MATCH (n:UnaryOp {id: $id}) RETURN n.op", {"id": node_id})
+    if kind == "UnaryOp":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.op", {"id": node_id})
         op_str = rows[0]["n.op"]
         op_map = {"not": ast.Not(), "-": ast.USub(), "+": ast.UAdd(), "~": ast.Invert()}
-        operand = _get_child_expr(conn, node_id, "UnaryOp", "operand")
+        operand = _get_child_expr(conn, node_id, "Expression", "operand")
         return ast.UnaryOp(op=op_map[op_str], operand=operand)
 
-    if node_type == "Compare":
-        rows = _q(conn, "MATCH (n:Compare {id: $id}) RETURN n", {"id": node_id})
-        n_props = rows[0]["n"]
-        ops_str_raw = n_props.get("ops") or n_props.get("op") or ""
+    if kind == "Compare":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.ops, n.op", {"id": node_id})
+        ops_str_raw = rows[0].get("n.ops") or rows[0].get("n.op") or ""
         ops_str = ops_str_raw.split(",") if ops_str_raw else []
         op_map = {
             # Symbol form
@@ -90,21 +117,21 @@ def _build_expr(conn: kuzu.Connection, node_id: str, node_type: str) -> ast.expr
             "Gt": ast.Gt(), "GtE": ast.GtE(), "In": ast.In(), "NotIn": ast.NotIn(),
             "Is": ast.Is(), "IsNot": ast.IsNot(),
         }
-        left = _get_child_expr(conn, node_id, "Compare", "left")
+        left = _get_child_expr(conn, node_id, "Expression", "left")
         # LLM may use 'comparator' or 'right' for the right-hand side(s)
-        comparators = _get_ordered_child_exprs(conn, node_id, "Compare", "comparator")
+        comparators = _get_ordered_child_exprs(conn, node_id, "Expression", "comparator")
         if not comparators:
-            comparators = _get_ordered_child_exprs(conn, node_id, "Compare", "right")
+            comparators = _get_ordered_child_exprs(conn, node_id, "Expression", "right")
         return ast.Compare(
             left=left,
             ops=[op_map[o.strip()] for o in ops_str],
             comparators=comparators,
         )
 
-    if node_type == "Call":
-        rows = _q(conn, "MATCH (n:Call {id: $id}) RETURN n.func", {"id": node_id})
+    if kind == "Call":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.func", {"id": node_id})
         func_name = rows[0].get("n.func")
-        
+
         if func_name:
             parts = func_name.split(".")
             if len(parts) == 1:
@@ -114,75 +141,67 @@ def _build_expr(conn: kuzu.Connection, node_id: str, node_type: str) -> ast.expr
                 for attr in parts[1:]:
                     func_node = ast.Attribute(value=func_node, attr=attr, ctx=ast.Load())
         else:
-            func_node = _get_child_expr(conn, node_id, "Call", "func")
-        args = _get_ordered_child_exprs(conn, node_id, "Call", "arg")
+            func_node = _get_child_expr(conn, node_id, "Expression", "func")
+        args = _get_ordered_child_exprs(conn, node_id, "Expression", "arg")
         return ast.Call(func=func_node, args=args, keywords=[])
 
-    if node_type == "BoolOp":
-        rows = _q(conn, "MATCH (n:BoolOp {id: $id}) RETURN n.op", {"id": node_id})
+    if kind == "BoolOp":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.op", {"id": node_id})
         op = ast.And() if rows[0]["n.op"] == "and" else ast.Or()
-        values = _get_ordered_child_exprs(conn, node_id, "BoolOp", "value")
+        values = _get_ordered_child_exprs(conn, node_id, "Expression", "value")
         return ast.BoolOp(op=op, values=values)
 
-    if node_type == "ListExpr":
-        elts = _get_ordered_child_exprs(conn, node_id, "ListExpr", "element")
+    if kind == "ListExpr":
+        elts = _get_ordered_child_exprs(conn, node_id, "Expression", "element")
         return ast.List(elts=elts, ctx=ast.Load())
 
-    if node_type == "DictExpr":
-        keys   = _get_ordered_child_exprs(conn, node_id, "DictExpr", "key")
-        values = _get_ordered_child_exprs(conn, node_id, "DictExpr", "value")
+    if kind == "DictExpr":
+        keys   = _get_ordered_child_exprs(conn, node_id, "Expression", "key")
+        values = _get_ordered_child_exprs(conn, node_id, "Expression", "value")
         return ast.Dict(keys=keys, values=values)
 
-    if node_type == "IfExp":
-        test  = _get_child_expr(conn, node_id, "IfExp", "test")
-        body  = _get_child_expr(conn, node_id, "IfExp", "body")
-        orelse = _get_child_expr(conn, node_id, "IfExp", "orelse")
+    if kind == "IfExp":
+        test  = _get_child_expr(conn, node_id, "Expression", "test")
+        body  = _get_child_expr(conn, node_id, "Expression", "body")
+        orelse = _get_child_expr(conn, node_id, "Expression", "orelse")
         return ast.IfExp(test=test, body=body, orelse=orelse)
 
-    raise ValueError(f"Unknown expression node type: {node_type}")
+    raise ValueError(f"Unknown expression kind: {kind}")
 
 
-def _get_expr_children(conn: kuzu.Connection, parent_id: str, parent_type: str):
-    """Return all HAS_EXPR_* children of a node, with role and order.
-    
-    Since rel tables are named HAS_EXPR_{Parent}_{Child}, we iterate over
-    all child expression types and query each specific rel table.
+def _get_expr_children(conn: kuzu.Connection, parent_id: str, parent_table: str) -> list[dict]:
+    """Return all HAS_EXPR children of a node, with role and order.
+
+    parent_table is "Statement", "Expression", or "Function".
+    Uses a single query against the collapsed edge table.
     """
-    from schema import EXPR_TYPES
-    children = []
-    for child_type in EXPR_TYPES:
-        rel_table = f"HAS_EXPR_{parent_type}_{child_type}"
-        cypher = (
-            f"MATCH (p:{parent_type} {{id: $pid}})-[e:{rel_table}]->(c:{child_type}) "
-            f"RETURN c.id AS cid, '{child_type}' AS ctype, e.role AS role, e.ord AS ord"
-        )
-        try:
-            rows = _q(conn, cypher, {"pid": parent_id})
-            children.extend(rows)
-        except Exception:
-            # Rel table may not exist for this parent/child combination — skip
-            pass
+    rel_table = f"HAS_EXPR_{parent_table}"
+    cypher = (
+        f"MATCH (p:{parent_table} {{id: $pid}})-[e:{rel_table}]->(c:Expression) "
+        f"RETURN c.id AS cid, c.kind AS ctype, e.role AS role, e.ord AS ord"
+    )
+    children = _q(conn, cypher, {"pid": parent_id})
     children.sort(key=lambda r: (r.get("role") or "", r.get("ord") or 0))
     return children
 
 
 def _get_child_expr(
-    conn: kuzu.Connection, parent_id: str, parent_type: str, role: str
+    conn: kuzu.Connection, parent_id: str, parent_table: str, role: str
 ) -> ast.expr:
     """Get the single expression child with the given role."""
-    children = _get_expr_children(conn, parent_id, parent_type)
+    children = _get_expr_children(conn, parent_id, parent_table)
     matches = [c for c in children if c["role"] == role]
     if not matches:
-        raise ValueError(f"No HAS_EXPR child with role='{role}' for {parent_type}:{parent_id}")
+        raise ValueError(f"No HAS_EXPR child with role='{role}' for {parent_table}:{parent_id}")
     r = matches[0]
     return _build_expr(conn, r["cid"], r["ctype"])
 
 
 def _get_ordered_child_exprs(
-    conn: kuzu.Connection, parent_id: str, parent_type: str, role: str
+    conn: kuzu.Connection, parent_id: str, parent_table: str, role: str
 ) -> list[ast.expr]:
     """Get ordered list of expression children with the given role."""
-    children = _get_expr_children(conn, parent_id, parent_type)
+    children = _get_expr_children(conn, parent_id, parent_table)
     matches = sorted(
         [c for c in children if c["role"] == role],
         key=lambda r: r.get("ord") or 0,
@@ -192,11 +211,11 @@ def _get_ordered_child_exprs(
 
 # ── statement reconstruction ──────────────────────────────────────────────────
 
-def _build_stmt(conn: kuzu.Connection, node_id: str, node_type: str) -> ast.stmt:
+def _build_stmt(conn: kuzu.Connection, node_id: str, kind: str) -> ast.stmt:
     """Reconstruct a single ast.stmt from a graph node."""
 
-    if node_type == "Return":
-        children = _get_expr_children(conn, node_id, "Return")
+    if kind == "Return":
+        children = _get_expr_children(conn, node_id, "Statement")
         values = [c for c in children if c["role"] == "value"]
         if values:
             val = _build_expr(conn, values[0]["cid"], values[0]["ctype"])
@@ -204,78 +223,82 @@ def _build_stmt(conn: kuzu.Connection, node_id: str, node_type: str) -> ast.stmt
             val = None
         return ast.Return(value=val)
 
-    if node_type == "Assign":
-        rows = _q(conn, "MATCH (n:Assign {id: $id}) RETURN n.targets", {"id": node_id})
+    if kind == "Assign":
+        rows = _q(conn, "MATCH (n:Statement {id: $id}) RETURN n.targets", {"id": node_id})
         target_names = rows[0]["n.targets"].split(",")
         targets = [ast.Name(id=t.strip(), ctx=ast.Store()) for t in target_names]
-        value = _get_child_expr(conn, node_id, "Assign", "value")
+        value = _get_child_expr(conn, node_id, "Statement", "value")
         return ast.Assign(targets=targets, value=value, lineno=0)
 
-    if node_type == "IfStmt":
-        test = _get_child_expr(conn, node_id, "IfStmt", "test")
-        body   = _get_block_stmts(conn, node_id, "IfStmt", branch="then")
-        orelse = _get_block_stmts(conn, node_id, "IfStmt", branch="else")
+    if kind == "IfStmt":
+        test = _get_child_expr(conn, node_id, "Statement", "test")
+        body   = _get_block_stmts(conn, node_id, "IfStmt", role="body")
+        orelse = _get_block_stmts(conn, node_id, "IfStmt", role="orelse")
         return ast.If(test=test, body=body or [ast.Pass()], orelse=orelse)
 
-    if node_type == "ForLoop":
-        rows = _q(conn, "MATCH (n:ForLoop {id: $id}) RETURN n.target", {"id": node_id})
+    if kind == "ForLoop":
+        rows = _q(conn, "MATCH (n:Statement {id: $id}) RETURN n.target", {"id": node_id})
         target = ast.Name(id=rows[0]["n.target"], ctx=ast.Store())
-        iter_  = _get_child_expr(conn, node_id, "ForLoop", "iter")
+        iter_  = _get_child_expr(conn, node_id, "Statement", "iter")
         body   = _get_block_stmts(conn, node_id, "ForLoop")
         return ast.For(target=target, iter=iter_, body=body or [ast.Pass()], orelse=[])
 
-    if node_type == "WhileLoop":
-        test = _get_child_expr(conn, node_id, "WhileLoop", "test")
+    if kind == "WhileLoop":
+        test = _get_child_expr(conn, node_id, "Statement", "test")
         body = _get_block_stmts(conn, node_id, "WhileLoop")
         return ast.While(test=test, body=body or [ast.Pass()], orelse=[])
 
-    if node_type == "ExprStmt":
-        children = _get_expr_children(conn, node_id, "ExprStmt")
+    if kind == "ExprStmt":
+        children = _get_expr_children(conn, node_id, "Statement")
         expr = _build_expr(conn, children[0]["cid"], children[0]["ctype"])
         return ast.Expr(value=expr)
 
-    if node_type == "Pass":
+    if kind == "Pass":
         return ast.Pass()
-    if node_type == "Break":
+    if kind == "Break":
         return ast.Break()
-    if node_type == "Continue":
+    if kind == "Continue":
         return ast.Continue()
 
-    raise ValueError(f"Unknown statement node type: {node_type}")
+    raise ValueError(f"Unknown statement kind: {kind}")
 
 
 def _get_block_stmts(
     conn: kuzu.Connection,
     parent_id: str,
-    parent_type: str,
-    branch: str | None = None,
+    parent_kind: str,
+    role: str | None = None,
 ) -> list[ast.stmt]:
     """
-    Fetch all HAS_STMT_* children of a block node, ordered by `ord`.
-    If branch is given, filter to that branch (for IfStmt then/else).
+    Fetch all HAS_STMT children of a block node, ordered by `ord`.
+    If role is given, filter to that role (e.g. "body", "orelse").
+
+    parent_kind: "Function", "IfStmt", "ForLoop", or "WhileLoop"
     """
-    from schema import STMT_TYPES
-    children: list[dict] = []
-    for child_type in STMT_TYPES:
-        rel_table = f"HAS_STMT_{parent_type}_{child_type}"
-        if branch:
-            cypher = (
-                f"MATCH (p:{parent_type} {{id: $pid}})-[e:{rel_table}]->(c:{child_type}) "
-                f"WHERE e.branch = $branch "
-                f"RETURN c.id AS cid, '{child_type}' AS ctype, e.ord AS ord"
-            )
-            rows = _q(conn, cypher, {"pid": parent_id, "branch": branch})
-        else:
-            cypher = (
-                f"MATCH (p:{parent_type} {{id: $pid}})-[e:{rel_table}]->(c:{child_type}) "
-                f"RETURN c.id AS cid, '{child_type}' AS ctype, e.ord AS ord"
-            )
-            rows = _q(conn, cypher, {"pid": parent_id})
-        try:
-            children.extend(rows)
-        except Exception:
-            pass
-    children.sort(key=lambda r: r.get("ord") or 0)
+    rel_table = f"HAS_STMT_{parent_kind}"
+
+    # Determine the parent table (Function or Statement)
+    if parent_kind == "Function":
+        parent_table = "Function"
+    else:
+        parent_table = "Statement"
+
+    if role:
+        cypher = (
+            f"MATCH (p:{parent_table} {{id: $pid}})-[e:{rel_table}]->(c:Statement) "
+            f"WHERE e.role = $role "
+            f"RETURN c.id AS cid, c.kind AS ctype, e.ord AS ord "
+            f"ORDER BY e.ord"
+        )
+        children = _q(conn, cypher, {"pid": parent_id, "role": role})
+    else:
+        cypher = (
+            f"MATCH (p:{parent_table} {{id: $pid}})-[e:{rel_table}]->(c:Statement) "
+            f"RETURN c.id AS cid, c.kind AS ctype, e.ord AS ord "
+            f"ORDER BY e.ord"
+        )
+        children = _q(conn, cypher, {"pid": parent_id})
+
     return [_build_stmt(conn, r["cid"], r["ctype"]) for r in children]
 
 
@@ -397,6 +420,8 @@ def build_module(conn: kuzu.Connection, module_id: str) -> ast.Module:
 
 def unparse_to_python(conn: kuzu.Connection, module_id: str) -> str:
     """Full pipeline: graph → ast.Module → Python source string."""
+    _check_schema_version(conn)
+    validate_graph(conn)
     module = build_module(conn, module_id)
     return ast.unparse(module)
 
@@ -420,7 +445,7 @@ def unparse_requirements(conn: kuzu.Connection, output_dir: str) -> None:
 
     req_path = os.path.join(output_dir, "requirements.txt")
     print(f"  📄 Generating 'requirements.txt' → {req_path}")
-    
+
     with open(req_path, "w") as f:
         for row in result:
             name = row["d.name"]
@@ -451,6 +476,9 @@ def unparse_project(conn: kuzu.Connection, output_dir: str) -> dict[str, str]:
     Returns a dict of {file_path: source_code}.
     """
     import os
+
+    _check_schema_version(conn)
+    validate_graph(conn)
 
     result = _q(conn, "MATCH (m:Module) RETURN m.id, m.name")
     if not result:

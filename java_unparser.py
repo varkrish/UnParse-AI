@@ -14,6 +14,8 @@ Mapping decisions:
   If/else             → standard Java if/else with braces
   Assign              → var {target} = ...;  (Java 10+ local type inference)
   Return None         → return;   (void method — cannot return a value)
+
+v0.2.0 — Unified Statement/Expression tables. Dispatch on kind column.
 """
 
 from __future__ import annotations
@@ -21,6 +23,9 @@ from __future__ import annotations
 import os
 
 import kuzu
+
+from schema import SCHEMA_VERSION
+from src.ast_agent.graph_validator import validate_graph, GraphValidationError
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -32,6 +37,26 @@ def _q(conn: kuzu.Connection, cypher: str, params: dict | None = None) -> list[d
     while result.has_next():
         rows.append(dict(zip(col_names, result.get_next())))
     return rows
+
+
+def _check_schema_version(conn: kuzu.Connection) -> None:
+    """Verify the DB schema version matches the unparser's expected version."""
+    try:
+        rows = _q(conn, "MATCH (m:SchemaMetadata) RETURN m.version")
+        if rows:
+            db_ver = rows[0]["m.version"]
+            if db_ver != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Schema version mismatch: DB has v{db_ver}, "
+                    f"unparser expects v{SCHEMA_VERSION}."
+                )
+    except Exception as e:
+        if "SchemaMetadata" in str(e):
+            raise RuntimeError(
+                f"Database has no SchemaMetadata table. "
+                f"Recreate with current schema.py."
+            )
+        raise
 
 
 # ── Type mapping ─────────────────────────────────────────────────────────────
@@ -62,70 +87,69 @@ def _java_type(python_type: str | None) -> str:
 def _expr(
     conn: kuzu.Connection,
     node_id: str,
-    node_type: str,
+    kind: str,
     import_map: dict[str, str],   # function_name → ClassName
 ) -> str:
     """Recursively generate a Java expression string from the graph."""
 
-    if node_type == "Name":
-        rows = _q(conn, "MATCH (n:Name {id: $id}) RETURN n.value", {"id": node_id})
+    if kind == "Name":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.value", {"id": node_id})
         val = rows[0]["n.value"]
         import re
         return re.sub(r'(\w+)\[(.*?)]', r'\1.get(\2)', val)
 
-    if node_type == "Constant":
-        rows = _q(conn, "MATCH (n:Constant {id: $id}) RETURN n.value, n.kind", {"id": node_id})
-        val, kind = rows[0]["n.value"], rows[0]["n.kind"]
-        if kind == "str":
+    if kind == "Constant":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.value, n.kind_lit", {"id": node_id})
+        val, kind_lit = rows[0]["n.value"], rows[0]["n.kind_lit"]
+        if kind_lit == "str":
             return f'"{val}"'
-        if kind in ("none", "None"):
+        if kind_lit in ("none", "None"):
             return "__NONE__"   # sentinel; handled in Return
-        if kind == "bool":
+        if kind_lit == "bool":
             return val.lower()
         # Cast float literals to double when they contain a decimal point
-        if kind == "float" and "." not in val:
+        if kind_lit == "float" and "." not in val:
             return val + ".0"
         return val
 
-    if node_type == "BinOp":
-        rows = _q(conn, "MATCH (n:BinOp {id: $id}) RETURN n.op", {"id": node_id})
+    if kind == "BinOp":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.op", {"id": node_id})
         op = rows[0]["n.op"]
-        left  = _get_child_expr(conn, node_id, "BinOp", "left", import_map)
-        right = _get_child_expr(conn, node_id, "BinOp", "right", import_map)
+        left  = _get_child_expr(conn, node_id, "Expression", "left", import_map)
+        right = _get_child_expr(conn, node_id, "Expression", "right", import_map)
         return f"({left} {op} {right})"
 
-    if node_type == "UnaryOp":
-        rows = _q(conn, "MATCH (n:UnaryOp {id: $id}) RETURN n.op", {"id": node_id})
+    if kind == "UnaryOp":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.op", {"id": node_id})
         op_map = {"not": "!", "-": "-", "+": "+"}
         op = op_map.get(rows[0]["n.op"], rows[0]["n.op"])
-        operand = _get_child_expr(conn, node_id, "UnaryOp", "operand", import_map)
+        operand = _get_child_expr(conn, node_id, "Expression", "operand", import_map)
         return f"{op}{operand}"
 
-    if node_type == "Compare":
-        rows = _q(conn, "MATCH (n:Compare {id: $id}) RETURN n", {"id": node_id})
-        n_props = rows[0]["n"]
-        ops_str_raw = n_props.get("ops") or n_props.get("op") or ""
+    if kind == "Compare":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.ops, n.op", {"id": node_id})
+        ops_str_raw = rows[0].get("n.ops") or rows[0].get("n.op") or ""
         ops_str = ops_str_raw.split(",") if ops_str_raw else []
         sym_map = {
             "==": "==", "!=": "!=", "<": "<", "<=": "<=", ">": ">", ">=": ">=",
             "Eq": "==", "NotEq": "!=", "Lt": "<", "LtE": "<=", "Gt": ">", "GtE": ">=",
         }
-        left = _get_child_expr(conn, node_id, "Compare", "left", import_map)
-        rights = _get_ordered_child_exprs(conn, node_id, "Compare", "comparator", import_map)
+        left = _get_child_expr(conn, node_id, "Expression", "left", import_map)
+        rights = _get_ordered_child_exprs(conn, node_id, "Expression", "comparator", import_map)
         if not rights:
-            rights = _get_ordered_child_exprs(conn, node_id, "Compare", "right", import_map)
+            rights = _get_ordered_child_exprs(conn, node_id, "Expression", "right", import_map)
         parts = [left]
         for op, right in zip(ops_str, rights):
             parts.append(sym_map.get(op.strip(), op.strip()))
             parts.append(right)
         return " ".join(parts)
 
-    if node_type == "Call":
-        rows = _q(conn, "MATCH (n:Call {id: $id}) RETURN n.func", {"id": node_id})
+    if kind == "Call":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.func", {"id": node_id})
         func = rows[0].get("n.func")
         if not func:
-            func = _get_child_expr(conn, node_id, "Call", "func", import_map)
-        args = _get_ordered_child_exprs(conn, node_id, "Call", "arg", import_map)
+            func = _get_child_expr(conn, node_id, "Expression", "func", import_map)
+        args = _get_ordered_child_exprs(conn, node_id, "Expression", "arg", import_map)
 
         # Qualify the function name with its source class if it came from an import
         if func in import_map:
@@ -134,48 +158,48 @@ def _expr(
             qualified = func
         return f"{qualified}({', '.join(args)})"
 
-    if node_type == "BoolOp":
-        rows = _q(conn, "MATCH (n:BoolOp {id: $id}) RETURN n.op", {"id": node_id})
+    if kind == "BoolOp":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.op", {"id": node_id})
         op = "&&" if rows[0]["n.op"] == "and" else "||"
-        values = _get_ordered_child_exprs(conn, node_id, "BoolOp", "value", import_map)
+        values = _get_ordered_child_exprs(conn, node_id, "Expression", "value", import_map)
         return f" {op} ".join(values)
 
-    if node_type == "ListExpr":
-        elts = _get_ordered_child_exprs(conn, node_id, "ListExpr", "element", import_map)
+    if kind == "ListExpr":
+        elts = _get_ordered_child_exprs(conn, node_id, "Expression", "element", import_map)
         return f"List.of({', '.join(elts)})"
 
-    raise ValueError(f"Unsupported expression node type for Java: {node_type}")
+    if kind == "IfExp":
+        raise NotImplementedError("IfExp (ternary) not yet supported in Java unparser")
+
+    if kind == "DictExpr":
+        raise NotImplementedError("DictExpr not yet supported in Java unparser")
+
+    raise ValueError(f"Unsupported expression kind for Java: {kind}")
 
 
-def _get_expr_children(conn, parent_id, parent_type):
-    from schema import EXPR_TYPES
-    children = []
-    for child_type in EXPR_TYPES:
-        rel = f"HAS_EXPR_{parent_type}_{child_type}"
-        cypher = (
-            f"MATCH (p:{parent_type} {{id: $pid}})-[e:{rel}]->(c:{child_type}) "
-            f"RETURN c.id AS cid, '{child_type}' AS ctype, e.role AS role, e.ord AS ord"
-        )
-        try:
-            rows = _q(conn, cypher, {"pid": parent_id})
-            children.extend(rows)
-        except Exception:
-            pass
+def _get_expr_children(conn, parent_id, parent_table):
+    """Return all HAS_EXPR children. parent_table is 'Statement' or 'Expression'."""
+    rel_table = f"HAS_EXPR_{parent_table}"
+    cypher = (
+        f"MATCH (p:{parent_table} {{id: $pid}})-[e:{rel_table}]->(c:Expression) "
+        f"RETURN c.id AS cid, c.kind AS ctype, e.role AS role, e.ord AS ord"
+    )
+    children = _q(conn, cypher, {"pid": parent_id})
     children.sort(key=lambda r: (r.get("role") or "", r.get("ord") or 0))
     return children
 
 
-def _get_child_expr(conn, parent_id, parent_type, role, import_map) -> str:
-    children = _get_expr_children(conn, parent_id, parent_type)
+def _get_child_expr(conn, parent_id, parent_table, role, import_map) -> str:
+    children = _get_expr_children(conn, parent_id, parent_table)
     matches = [c for c in children if c["role"] == role]
     if not matches:
-        raise ValueError(f"No HAS_EXPR child with role='{role}' for {parent_type}:{parent_id}")
+        raise ValueError(f"No HAS_EXPR child with role='{role}' for {parent_table}:{parent_id}")
     r = matches[0]
     return _expr(conn, r["cid"], r["ctype"], import_map)
 
 
-def _get_ordered_child_exprs(conn, parent_id, parent_type, role, import_map) -> list[str]:
-    children = _get_expr_children(conn, parent_id, parent_type)
+def _get_ordered_child_exprs(conn, parent_id, parent_table, role, import_map) -> list[str]:
+    children = _get_expr_children(conn, parent_id, parent_table)
     matches = sorted([c for c in children if c["role"] == role], key=lambda r: r.get("ord") or 0)
     return [_expr(conn, r["cid"], r["ctype"], import_map) for r in matches]
 
@@ -185,7 +209,7 @@ def _get_ordered_child_exprs(conn, parent_id, parent_type, role, import_map) -> 
 def _stmt(
     conn: kuzu.Connection,
     node_id: str,
-    node_type: str,
+    kind: str,
     import_map: dict[str, str],
     return_type: str = "Object",  # Java return type of the enclosing method
     indent: int = 8,
@@ -193,8 +217,8 @@ def _stmt(
     """Generate Java statement lines. Returns list of indented strings."""
     pad = " " * indent
 
-    if node_type == "Return":
-        children = _get_expr_children(conn, node_id, "Return")
+    if kind == "Return":
+        children = _get_expr_children(conn, node_id, "Statement")
         values = [c for c in children if c["role"] == "value"]
         if values:
             val = _expr(conn, values[0]["cid"], values[0]["ctype"], import_map)
@@ -204,20 +228,20 @@ def _stmt(
             return [f"{pad}return {val};"]
         return [f"{pad}return;"]
 
-    if node_type == "Assign":
-        rows = _q(conn, "MATCH (n:Assign {id: $id}) RETURN n.targets", {"id": node_id})
+    if kind == "Assign":
+        rows = _q(conn, "MATCH (n:Statement {id: $id}) RETURN n.targets", {"id": node_id})
         targets = rows[0]["n.targets"].split(",")[0].strip()
-        val_children = _get_expr_children(conn, node_id, "Assign")
+        val_children = _get_expr_children(conn, node_id, "Statement")
         val_nodes = [c for c in val_children if c["role"] == "value"]
         value = _expr(conn, val_nodes[0]["cid"], val_nodes[0]["ctype"], import_map) if val_nodes else "null"
         return [f"{pad}var {targets} = {value};"]
 
-    if node_type == "IfStmt":
-        test = _get_child_expr(conn, node_id, "IfStmt", "test", import_map)
+    if kind == "IfStmt":
+        test = _get_child_expr(conn, node_id, "Statement", "test", import_map)
         then_stmts = _get_block_stmts(conn, node_id, "IfStmt", import_map, return_type,
-                                       branch="then", indent=indent + 4)
+                                       role="body", indent=indent + 4)
         else_stmts = _get_block_stmts(conn, node_id, "IfStmt", import_map, return_type,
-                                       branch="else", indent=indent + 4)
+                                       role="orelse", indent=indent + 4)
         lines = [f"{pad}if ({test}) {{"]
         lines.extend(then_stmts)
         if else_stmts:
@@ -226,47 +250,55 @@ def _stmt(
         lines.append(f"{pad}}}")
         return lines
 
-    if node_type == "ExprStmt":
-        children = _get_expr_children(conn, node_id, "ExprStmt")
+    if kind == "ForLoop":
+        raise NotImplementedError("ForLoop not yet supported in Java unparser")
+
+    if kind == "WhileLoop":
+        raise NotImplementedError("WhileLoop not yet supported in Java unparser")
+
+    if kind == "ExprStmt":
+        children = _get_expr_children(conn, node_id, "Statement")
         val = _expr(conn, children[0]["cid"], children[0]["ctype"], import_map) if children else ""
         return [f"{pad}{val};"]
 
-    if node_type == "Pass":
+    if kind == "Pass":
         return [f"{pad}// pass"]
-    if node_type == "Break":
+    if kind == "Break":
         return [f"{pad}break;"]
-    if node_type == "Continue":
+    if kind == "Continue":
         return [f"{pad}continue;"]
 
-    return [f"{pad}// TODO: {node_type}"]
+    return [f"{pad}// TODO: {kind}"]
 
 
 def _get_block_stmts(
-    conn, parent_id, parent_type, import_map, return_type="Object",
-    branch=None, indent=8
+    conn, parent_id, parent_kind, import_map, return_type="Object",
+    role=None, indent=8
 ) -> list[str]:
-    from schema import STMT_TYPES
-    children = []
-    for child_type in STMT_TYPES:
-        rel = f"HAS_STMT_{parent_type}_{child_type}"
-        if branch:
-            cypher = (
-                f"MATCH (p:{parent_type} {{id: $pid}})-[e:{rel}]->(c:{child_type}) "
-                f"WHERE e.branch = $branch "
-                f"RETURN c.id AS cid, '{child_type}' AS ctype, e.ord AS ord"
-            )
-            rows = _q(conn, cypher, {"pid": parent_id, "branch": branch})
-        else:
-            cypher = (
-                f"MATCH (p:{parent_type} {{id: $pid}})-[e:{rel}]->(c:{child_type}) "
-                f"RETURN c.id AS cid, '{child_type}' AS ctype, e.ord AS ord"
-            )
-            rows = _q(conn, cypher, {"pid": parent_id})
-        try:
-            children.extend(rows)
-        except Exception:
-            pass
-    children.sort(key=lambda r: r.get("ord") or 0)
+    """Fetch child statements from a block parent."""
+    rel_table = f"HAS_STMT_{parent_kind}"
+
+    if parent_kind == "Function":
+        parent_table = "Function"
+    else:
+        parent_table = "Statement"
+
+    if role:
+        cypher = (
+            f"MATCH (p:{parent_table} {{id: $pid}})-[e:{rel_table}]->(c:Statement) "
+            f"WHERE e.role = $role "
+            f"RETURN c.id AS cid, c.kind AS ctype, e.ord AS ord "
+            f"ORDER BY e.ord"
+        )
+        children = _q(conn, cypher, {"pid": parent_id, "role": role})
+    else:
+        cypher = (
+            f"MATCH (p:{parent_table} {{id: $pid}})-[e:{rel_table}]->(c:Statement) "
+            f"RETURN c.id AS cid, c.kind AS ctype, e.ord AS ord "
+            f"ORDER BY e.ord"
+        )
+        children = _q(conn, cypher, {"pid": parent_id})
+
     lines = []
     for r in children:
         lines.extend(_stmt(conn, r["cid"], r["ctype"], import_map, return_type, indent))
@@ -334,6 +366,9 @@ def _build_method(
 
 def build_java_file(conn: kuzu.Connection, module_id: str) -> str:
     """Reads a Module node and returns Java source code string."""
+    _check_schema_version(conn)
+    validate_graph(conn)
+
     rows = _q(conn, "MATCH (m:Module {id: $id}) RETURN m.name, m.decorators", {"id": module_id})
     module_name = rows[0]["m.name"]
     class_decorators = rows[0].get("m.decorators") or ""
@@ -365,9 +400,9 @@ def build_java_file(conn: kuzu.Connection, module_id: str) -> str:
     for r in from_rows:
         module_path = r["module"]
         names = r["names"].split(",")
-        
+
         is_external = any(module_path.startswith(prefix) for prefix in ("org.", "java.", "javax.", "com.", "spring."))
-        
+
         if is_external:
             for name in names:
                 name = name.strip()
@@ -437,9 +472,9 @@ def unparse_pom(conn: kuzu.Connection, output_dir: str = "") -> str:
     for row in result:
         name = row["d.name"]
         ver = row["d.version"] or "1.0.0"
-        
+
         # Strip semver caret/tilde if present (e.g. ^2.31.0 -> 2.31.0)
-        ver_clean = ver.lstrip("^~=>")
+        ver_clean = ver.lstrip("^~=>\"")
 
         groupId = "org.example"
         artifactId = name
@@ -495,6 +530,9 @@ def unparse_java_project(conn: kuzu.Connection, output_dir: str) -> dict[str, st
       'calculator/operations' → output_dir/calculator/Operations.java
       'main'                  → output_dir/Main.java
     """
+    _check_schema_version(conn)
+    validate_graph(conn)
+
     result = _q(conn, "MATCH (m:Module) RETURN m.id, m.name")
     if not result:
         raise RuntimeError("No Module nodes found in the graph.")

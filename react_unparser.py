@@ -1,10 +1,15 @@
 """
 react_unparser.py — Reads the Kùzu AST graph and generates React JSX source code.
+
+v0.2.0 — Unified Statement/Expression tables. Dispatch on kind column.
 """
 
 from __future__ import annotations
 import kuzu
 import textwrap
+
+from schema import SCHEMA_VERSION
+
 
 def _q(conn: kuzu.Connection, cypher: str, params: dict | None = None) -> list[dict]:
     result = conn.execute(cypher, params or {})
@@ -14,101 +19,115 @@ def _q(conn: kuzu.Connection, cypher: str, params: dict | None = None) -> list[d
         rows.append(dict(zip(col_names, result.get_next())))
     return rows
 
-def _get_expr_children(conn, parent_id, parent_type):
-    from schema import EXPR_TYPES
-    children = []
-    for child_type in EXPR_TYPES:
-        rel = f"HAS_EXPR_{parent_type}_{child_type}"
-        cypher = (
-            f"MATCH (p:{parent_type} {{id: $pid}})-[e:{rel}]->(c:{child_type}) "
-            f"RETURN c.id AS cid, '{child_type}' AS ctype, e.role AS role, e.ord AS ord"
-        )
-        try:
-            for r in _q(conn, cypher, {"pid": parent_id}):
-                children.append(r)
-        except Exception:
-            pass
+
+def _check_schema_version(conn: kuzu.Connection) -> None:
+    """Verify the DB schema version matches the unparser's expected version."""
+    try:
+        rows = _q(conn, "MATCH (m:SchemaMetadata) RETURN m.version")
+        if rows:
+            db_ver = rows[0]["m.version"]
+            if db_ver != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Schema version mismatch: DB has v{db_ver}, "
+                    f"unparser expects v{SCHEMA_VERSION}."
+                )
+    except Exception as e:
+        if "SchemaMetadata" in str(e):
+            raise RuntimeError(
+                f"Database has no SchemaMetadata table. "
+                f"Recreate with current schema.py."
+            )
+        raise
+
+
+def _get_expr_children(conn, parent_id, parent_table):
+    """Return all HAS_EXPR children. parent_table is 'Statement' or 'Expression'."""
+    rel_table = f"HAS_EXPR_{parent_table}"
+    cypher = (
+        f"MATCH (p:{parent_table} {{id: $pid}})-[e:{rel_table}]->(c:Expression) "
+        f"RETURN c.id AS cid, c.kind AS ctype, e.role AS role, e.ord AS ord"
+    )
+    children = _q(conn, cypher, {"pid": parent_id})
     children.sort(key=lambda r: (r.get("role") or "", r.get("ord") or 0))
     return children
 
-def _get_child_expr(conn, parent_id, parent_type, role):
-    matches = [c for c in _get_expr_children(conn, parent_id, parent_type) if c["role"] == role]
+def _get_child_expr(conn, parent_id, parent_table, role):
+    matches = [c for c in _get_expr_children(conn, parent_id, parent_table) if c["role"] == role]
     if not matches:
         return None
     r = matches[0]
     return _build_expr(conn, r["cid"], r["ctype"])
 
-def _get_ordered_child_exprs(conn, parent_id, parent_type, role):
+def _get_ordered_child_exprs(conn, parent_id, parent_table, role):
     matches = sorted(
-        [c for c in _get_expr_children(conn, parent_id, parent_type) if c["role"] == role],
+        [c for c in _get_expr_children(conn, parent_id, parent_table) if c["role"] == role],
         key=lambda r: r.get("ord") or 0,
     )
     return [_build_expr(conn, r["cid"], r["ctype"]) for r in matches]
 
-def _build_expr(conn: kuzu.Connection, node_id: str, node_type: str) -> str:
+def _build_expr(conn: kuzu.Connection, node_id: str, kind: str) -> str:
     """Recursively generate a React expression/JSX string from the graph."""
-    if node_type == "Name":
-        rows = _q(conn, "MATCH (n:Name {id: $id}) RETURN n.value", {"id": node_id})
+    if kind == "Name":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.value", {"id": node_id})
         return rows[0]["n.value"]
 
-    if node_type == "Constant":
-        rows = _q(conn, "MATCH (n:Constant {id: $id}) RETURN n.value, n.kind", {"id": node_id})
-        val, kind = rows[0]["n.value"], rows[0]["n.kind"]
-        if kind == "str":
+    if kind == "Constant":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.value, n.kind_lit", {"id": node_id})
+        val, kind_lit = rows[0]["n.value"], rows[0]["n.kind_lit"]
+        if kind_lit == "str":
             return f'"{val}"'
-        if kind in ("none", "None"):
+        if kind_lit in ("none", "None"):
             return "null"
-        if kind == "bool":
+        if kind_lit == "bool":
             return val.lower()
         return val
 
-    if node_type == "BinOp":
-        rows = _q(conn, "MATCH (n:BinOp {id: $id}) RETURN n.op", {"id": node_id})
+    if kind == "BinOp":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.op", {"id": node_id})
         op = rows[0]["n.op"]
-        left  = _get_child_expr(conn, node_id, "BinOp", "left")
-        right = _get_child_expr(conn, node_id, "BinOp", "right")
+        left  = _get_child_expr(conn, node_id, "Expression", "left")
+        right = _get_child_expr(conn, node_id, "Expression", "right")
         return f"({left} {op} {right})"
 
-    if node_type == "UnaryOp":
-        rows = _q(conn, "MATCH (n:UnaryOp {id: $id}) RETURN n.op", {"id": node_id})
+    if kind == "UnaryOp":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.op", {"id": node_id})
         op_map = {"not": "!", "-": "-", "+": "+"}
         op = op_map.get(rows[0]["n.op"], rows[0]["n.op"])
-        operand = _get_child_expr(conn, node_id, "UnaryOp", "operand")
+        operand = _get_child_expr(conn, node_id, "Expression", "operand")
         return f"{op}{operand}"
 
-    if node_type == "Compare":
-        rows = _q(conn, "MATCH (n:Compare {id: $id}) RETURN n", {"id": node_id})
-        n_props = rows[0]["n"]
-        ops_str_raw = n_props.get("ops") or n_props.get("op") or ""
+    if kind == "Compare":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.ops, n.op", {"id": node_id})
+        ops_str_raw = rows[0].get("n.ops") or rows[0].get("n.op") or ""
         ops_str = ops_str_raw.split(",") if ops_str_raw else []
         sym_map = {
             "==": "===", "!=": "!==", "<": "<", "<=": "<=", ">": ">", ">=": ">=",
             "Eq": "===", "NotEq": "!==", "Lt": "<", "LtE": "<=", "Gt": ">", "GtE": ">=",
         }
-        left = _get_child_expr(conn, node_id, "Compare", "left")
-        rights = _get_ordered_child_exprs(conn, node_id, "Compare", "comparator")
+        left = _get_child_expr(conn, node_id, "Expression", "left")
+        rights = _get_ordered_child_exprs(conn, node_id, "Expression", "comparator")
         if not rights:
-            rights = _get_ordered_child_exprs(conn, node_id, "Compare", "right")
+            rights = _get_ordered_child_exprs(conn, node_id, "Expression", "right")
         parts = [left]
         for op, right in zip(ops_str, rights):
             parts.append(sym_map.get(op.strip(), op.strip()))
             parts.append(right)
         return " ".join(parts)
 
-    if node_type == "Call":
-        rows = _q(conn, "MATCH (n:Call {id: $id}) RETURN n.func", {"id": node_id})
+    if kind == "Call":
+        rows = _q(conn, "MATCH (n:Expression {id: $id}) RETURN n.func", {"id": node_id})
         func = rows[0].get("n.func")
         if not func:
-            func = _get_child_expr(conn, node_id, "Call", "func")
-            
-        args = _get_ordered_child_exprs(conn, node_id, "Call", "arg")
-        
+            func = _get_child_expr(conn, node_id, "Expression", "func")
+
+        args = _get_ordered_child_exprs(conn, node_id, "Expression", "arg")
+
         is_html = func in (
             "div", "span", "button", "input", "h1", "h2", "h3", "h4", "h5", "h6",
             "p", "a", "form", "label", "br", "ul", "li", "header", "footer", "main", "section"
         )
         is_react_comp = func[0].isupper() if func else False
-        
+
         # Macros
         if func == "fetchAdd":
             a, b, set_result = args[0], args[1], args[2]
@@ -131,14 +150,14 @@ def _build_expr(conn: kuzu.Connection, node_id: str, node_type: str) -> str:
         if (is_html or is_react_comp) and "." not in func:
             props_str = ""
             children = args
-            
-            if args and args[0].startswith("{") and ":" in args[0]: 
+
+            if args and args[0].startswith("{") and ":" in args[0]:
                 props_str = f" {{...{args[0]}}}"
                 children = args[1:]
-                
+
             if not children:
                 return f"<{func}{props_str} />"
-            
+
             child_str = ""
             import re
             for c in children:
@@ -153,14 +172,14 @@ def _build_expr(conn: kuzu.Connection, node_id: str, node_type: str) -> str:
                 else:
                     # Plain text
                     child_str += c
-            
+
             return f"<{func}{props_str}>{child_str}</{func}>"
-            
+
         return f"{func}({', '.join(args)})"
 
-    if node_type == "DictExpr":
-        keys   = _get_ordered_child_exprs(conn, node_id, "DictExpr", "key")
-        values = _get_ordered_child_exprs(conn, node_id, "DictExpr", "value")
+    if kind == "DictExpr":
+        keys   = _get_ordered_child_exprs(conn, node_id, "Expression", "key")
+        values = _get_ordered_child_exprs(conn, node_id, "Expression", "value")
         pairs = []
         for k, v in zip(keys, values):
             if k.startswith('"') and k.endswith('"') and k[1:-1].isidentifier():
@@ -168,62 +187,80 @@ def _build_expr(conn: kuzu.Connection, node_id: str, node_type: str) -> str:
             pairs.append(f"{k}: {v}")
         return f"{{{', '.join(pairs)}}}"
 
-    if node_type == "ListExpr":
-        elts = _get_ordered_child_exprs(conn, node_id, "ListExpr", "element")
+    if kind == "ListExpr":
+        elts = _get_ordered_child_exprs(conn, node_id, "Expression", "element")
         return f"[{', '.join(elts)}]"
 
-    raise ValueError(f"Unsupported expression node type for React: {node_type}")
+    if kind == "IfExp":
+        raise NotImplementedError("IfExp not yet supported in React unparser")
 
-def _build_stmt(conn: kuzu.Connection, node_id: str, node_type: str) -> str | None:
-    if node_type == "Return":
-        val = _get_child_expr(conn, node_id, "Return", "value")
+    raise ValueError(f"Unsupported expression kind for React: {kind}")
+
+def _build_stmt(conn: kuzu.Connection, node_id: str, kind: str) -> str | None:
+    if kind == "Return":
+        val = _get_child_expr(conn, node_id, "Statement", "value")
         if val:
             if val.startswith("<"):
                 return f"return (\n  {val}\n);"
             return f"return {val};"
         return "return;"
 
-    if node_type == "Assign":
-        rows = _q(conn, "MATCH (n:Assign {id: $id}) RETURN n.targets", {"id": node_id})
+    if kind == "Assign":
+        rows = _q(conn, "MATCH (n:Statement {id: $id}) RETURN n.targets", {"id": node_id})
         targets = rows[0]["n.targets"].split(",")
-        val = _get_child_expr(conn, node_id, "Assign", "value")
+        val = _get_child_expr(conn, node_id, "Statement", "value")
         return f"const {', '.join(t.strip() for t in targets)} = {val};"
 
-    if node_type == "ExprStmt":
-        val = _get_child_expr(conn, node_id, "ExprStmt", "value")
+    if kind == "ExprStmt":
+        val = _get_child_expr(conn, node_id, "Statement", "value")
         # In JSX, expr stmts might just be children. But let's assume standard JS
         return f"{val};"
-        
-    if node_type == "Pass":
+
+    if kind == "Pass":
         return "// pass"
 
-    raise ValueError(f"Unsupported statement node type for React: {node_type}")
+    if kind == "IfStmt":
+        raise NotImplementedError("IfStmt not yet supported in React unparser")
 
-def _get_block_stmts(conn, parent_id, parent_type, branch="", indent=2):
-    from schema import STMT_TYPES
+    if kind == "ForLoop":
+        raise NotImplementedError("ForLoop not yet supported in React unparser")
+
+    if kind == "WhileLoop":
+        raise NotImplementedError("WhileLoop not yet supported in React unparser")
+
+    raise ValueError(f"Unsupported statement kind for React: {kind}")
+
+def _get_block_stmts(conn, parent_id, parent_kind, role=None, indent=2):
+    """Fetch child statements from a block parent."""
+    rel_table = f"HAS_STMT_{parent_kind}"
+
+    if parent_kind == "Function":
+        parent_table = "Function"
+    else:
+        parent_table = "Statement"
+
+    if role:
+        cypher = (
+            f"MATCH (p:{parent_table} {{id: $pid}})-[e:{rel_table}]->(c:Statement) "
+            f"WHERE e.role = $role "
+            f"RETURN c.id AS sid, c.kind AS stype, e.ord AS ord "
+            f"ORDER BY e.ord"
+        )
+        stmts = _q(conn, cypher, {"pid": parent_id, "role": role})
+    else:
+        cypher = (
+            f"MATCH (p:{parent_table} {{id: $pid}})-[e:{rel_table}]->(c:Statement) "
+            f"RETURN c.id AS sid, c.kind AS stype, e.ord AS ord "
+            f"ORDER BY e.ord"
+        )
+        stmts = _q(conn, cypher, {"pid": parent_id})
+
     lines = []
-    stmts = []
-    for stmt_type in STMT_TYPES:
-        rel = f"HAS_STMT_{parent_type}_{stmt_type}"
-        c = f"MATCH (p:{parent_type} {{id: $pid}})-[e:{rel}]->(s:{stmt_type}) "
-        if branch:
-            c += "WHERE e.branch = $branch "
-        c += f"RETURN s.id AS sid, '{stmt_type}' AS stype, e.ord AS ord"
-        params = {"pid": parent_id}
-        if branch:
-            params["branch"] = branch
-        try:
-            for r in _q(conn, c, params):
-                stmts.append(r)
-        except Exception as e:
-            print(f"Error querying {rel}: {e}")
-    stmts.sort(key=lambda r: r["ord"])
-    
     for r in stmts:
         stmt_str = _build_stmt(conn, r["sid"], r["stype"])
         if stmt_str:
             lines.extend(stmt_str.split("\n"))
-            
+
     pad = " " * indent
     return [f"{pad}{line}" for line in lines]
 
@@ -234,7 +271,7 @@ def _module_to_component_name(module_name: str) -> str:
 def _build_method(conn, func_id, indent=2):
     rows = _q(conn, "MATCH (f:Function {id: $id}) RETURN f.name", {"id": func_id})
     name = rows[0]["f.name"]
-    
+
     arg_rows = _q(
         conn,
         "MATCH (f:Function {id: $id})-[e:HAS_ARG]->(a:Argument) "
@@ -242,9 +279,9 @@ def _build_method(conn, func_id, indent=2):
         {"id": func_id},
     )
     args = ", ".join(ar["a.name"] for ar in arg_rows)
-    
+
     body_lines = _get_block_stmts(conn, func_id, "Function", indent=indent + 2)
-    
+
     pad = " " * indent
     lines = [f"{pad}function {name}({args}) {{"]
     if body_lines:
@@ -255,12 +292,14 @@ def _build_method(conn, func_id, indent=2):
     return lines
 
 def build_react_file(conn: kuzu.Connection, module_id: str) -> str:
+    _check_schema_version(conn)
+
     rows = _q(conn, "MATCH (m:Module {id: $id}) RETURN m.name", {"id": module_id})
     module_name = rows[0]["m.name"]
     comp_name = _module_to_component_name(module_name)
-    
+
     lines = ["import React, { useState, useEffect } from 'react';"]
-    
+
     import_rows = _q(
         conn,
         "MATCH (m:Module {id: $id})-[e:HAS_IMPORT_Import]->(i:Import) "
@@ -270,23 +309,23 @@ def build_react_file(conn: kuzu.Connection, module_id: str) -> str:
     for r in import_rows:
         for name in r["names"].split(","):
             lines.append(f"import {name.strip()};")
-            
+
     lines.append("")
-    
+
     func_rows = _q(
         conn,
         "MATCH (m:Module {id: $id})-[e:HAS_FUNCTION_Module]->(f:Function) "
         "RETURN f.id ORDER BY e.ord",
         {"id": module_id},
     )
-    
+
     for r in func_rows:
         func_lines = _build_method(conn, r["f.id"], indent=0)
         first_line = func_lines[0]
         if comp_name in first_line:
             func_lines[0] = "export default " + first_line
-            
+
         lines.extend(func_lines)
         lines.append("")
-        
+
     return "\n".join(lines) + "\n"
